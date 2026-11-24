@@ -43,6 +43,21 @@ private slots:
         QVERIFY(!ControlReconnect::shouldRetryFromWatchdog(false, false, false, false, true));
     }
 
+    void announcesOnlyALinkBluezDropped()
+    {
+        QVERIFY(ControlReconnect::shouldAnnounceDisconnect(false, false));
+
+        // Control socket refused for the whole ladder while BlueZ kept the device and audio played.
+        QVERIFY(!ControlReconnect::shouldAnnounceDisconnect(false, true));
+
+        // Suspend and resume drop the link on purpose.
+        QVERIFY(!ControlReconnect::shouldAnnounceDisconnect(true, false));
+
+        // Pods left in the case accept a page, never go in an ear and hang up: no toast each cycle.
+        QVERIFY(!ControlReconnect::shouldAnnounceDisconnect(false, false, false));
+        QVERIFY(ControlReconnect::shouldAnnounceDisconnect(false, false, true));
+    }
+
     void watchdogSweepsBlueZWhenTheDaemonStartedBeforeTheAdapter()
     {
         // Cold start with the adapter down: no address was ever learned, so the retry ladder cannot run.

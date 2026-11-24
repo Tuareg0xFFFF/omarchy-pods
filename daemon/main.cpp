@@ -21,6 +21,7 @@
 #include <QQuickWindow>
 #include <QLoggingCategory>
 #include <QThread>
+#include <QPointer>
 #include <QTimer>
 #include <QProcess>
 #include <QRegularExpression>
@@ -791,6 +792,31 @@ private slots:
         writePacketToSocket(AirPodsPackets::Connection::HANDSHAKE, "Handshake packet written: ");
     }
 
+    // A link that never reports battery or ear state leaves the bar stale and ear detection dead, and nothing else retries it.
+    void armControlStatusWatchdog()
+    {
+        QTimer::singleShot(ControlReconnect::statusWaitMs, this,
+                           [this, armedFor = QPointer<QBluetoothSocket>(socket)]() {
+            // A replacement socket arms its own watchdog.
+            if (!armedFor || armedFor != socket || m_controlStatusSeen) {
+                return;
+            }
+            const QString address = m_deviceInfo->bluetoothAddress();
+            if (!ControlReconnect::hasAttemptRemaining(m_handshakesResent,
+                                                       ControlReconnect::statusHandshakeResendLimit)) {
+                LOG_ERROR("AirPods " << address << " sent no battery or ear status after "
+                          << (m_handshakesResent + 1) << " handshakes, restart librepods to recover");
+                return;
+            }
+            ++m_handshakesResent;
+            LOG_WARN("AirPods " << address << " sent no battery or ear status "
+                     << ControlReconnect::statusWaitMs << "ms after the handshake, re-sending it ("
+                     << m_handshakesResent << "/" << ControlReconnect::statusHandshakeResendLimit << ")");
+            writePacketToSocket(AirPodsPackets::Connection::HANDSHAKE, "Handshake packet written: ");
+            armControlStatusWatchdog();
+        });
+    }
+
     void bluezDeviceConnected(const QString &address, const QString &name)
     {
         rememberAirPodsDevice(address, name);
@@ -841,7 +867,7 @@ private slots:
                                  QStringLiteral("BlueZ disconnect event"));
     }
 
-    void finalizeDeviceDisconnected(const QString &address)
+    void finalizeDeviceDisconnected(const QString &address, bool bluezStillConnected = false)
     {
         if (m_disconnectFinalized) {
             return;
@@ -857,6 +883,9 @@ private slots:
             LOG_DEBUG("AIRPODS_DISCONNECTED packet written: " << AirPodsPackets::Connection::AIRPODS_DISCONNECTED.toHex());
         }
 
+        // A headset reports no in-ear state we track here, so it always counts as worn.
+        const bool worn = m_wornThisLink || isModelHeadset(m_deviceInfo->model());
+
         // Clear the device name and model
         m_deviceInfo->reset();
         m_bleManager->startScan();
@@ -866,11 +895,14 @@ private slots:
         // fires PropertiesChanged Connected=false on suspend and the user
         // doesn't want to see "AirPods Disconnected" every time they close
         // the lid. Tray icon still resets so visual state is accurate.
-        if (!m_isSuspending) {
+        if (ControlReconnect::shouldAnnounceDisconnect(m_isSuspending, bluezStillConnected, worn)) {
             m_notifier->notify(
                 tr("AirPods Disconnected"),
                 tr("Your AirPods have been disconnected"));
+        } else if (!worn) {
+            LOG_INFO("No disconnect toast: no pod was in an ear on this link");
         }
+        m_wornThisLink = false;
         if (trayManager) {
             trayManager->resetTrayIcon();
         }
@@ -1003,7 +1035,7 @@ private slots:
             LOG_INFO("AirPods stayed disconnected through control recovery, finalizing "
                      << m_lastAirPodsAddress);
         }
-        finalizeDeviceDisconnected(m_lastAirPodsAddress);
+        finalizeDeviceDisconnected(m_lastAirPodsAddress, deviceStillConnected);
     }
 
     void finishControlRecovery()
@@ -1146,7 +1178,10 @@ private slots:
             QByteArray data = localSocket->readAll();
             QMetaObject::invokeMethod(this, "parseData", Qt::QueuedConnection, Q_ARG(QByteArray, data));
             QMetaObject::invokeMethod(this, "relayPacketToPhone", Qt::QueuedConnection, Q_ARG(QByteArray, data)); });
+            m_controlStatusSeen = false;
+            m_handshakesResent = 0;
             sendHandshake();
+            armControlStatusWatchdog();
         };
 
         // Error handler with retry. Per-device member instead of static so
@@ -1216,6 +1251,14 @@ private slots:
                 });
 
         localSocket->connectToService(device.address(), QBluetoothUuid("74ec2172-0bad-4d01-8f77-997b2be0722a"));
+        // Recovery can land on another pair, and the old pair's battery and ear state would read as this one's.
+        const QString previousAddress = m_deviceInfo->bluetoothAddress();
+        if (!previousAddress.isEmpty()
+            && previousAddress.compare(device.address().toString(), Qt::CaseInsensitive) != 0) {
+            LOG_INFO("Control link moved from " << previousAddress << " to "
+                     << device.address().toString() << ", clearing the previous pair's state");
+            m_deviceInfo->reset();
+        }
         m_deviceInfo->setBluetoothAddress(device.address().toString());
         notifyAndroidDevice();
     }
@@ -1269,7 +1312,7 @@ private slots:
             writePacketToSocket(AirPodsPackets::Connection::REQUEST_NOTIFICATIONS, "Request notifications packet written: ");
 
             QTimer::singleShot(2000, this, [this]() {
-                if (m_deviceInfo->batteryStatus().isEmpty()) {
+                if (!m_controlStatusSeen) {
                     writePacketToSocket(AirPodsPackets::Connection::REQUEST_NOTIFICATIONS, "Request notifications packet written: ");
                 }
             });
@@ -1316,12 +1359,17 @@ private slots:
         // Ear Detection
         else if (data.size() == 8 && data.startsWith(AirPodsPackets::Parse::EAR_DETECTION))
         {
+            m_controlStatusSeen = true;
             m_deviceInfo->getEarDetection()->parseData(data);
             mediaController->handleEarDetection(m_deviceInfo->getEarDetection());
+            if (m_deviceInfo->getEarDetection()->oneOrMorePodsInEar()) {
+                m_wornThisLink = true;
+            }
         }
         // Battery Status
         else if ((data.size() == 22 || data.size() == 12) && data.startsWith(AirPodsPackets::Parse::BATTERY_STATUS))
         {
+            m_controlStatusSeen = true;
             m_deviceInfo->getBattery()->parsePacket(data);
             m_deviceInfo->updateBatteryStatus();
             LOG_INFO("Battery status: " << m_deviceInfo->batteryStatus());
@@ -1639,6 +1687,9 @@ private:
     QTimer *m_controlWatchdogTimer = nullptr;
     // Last answer BlueZ gave about this device, which is what separates a dead link from absent pods.
     bool m_bluezReportedConnected = false;
+    // Recovery keeps the previous link's DeviceInfo, so only a report on the current socket proves it is talking.
+    bool m_controlStatusSeen = false;
+    int m_handshakesResent = 0;
     QSettings *m_settings;
     AutoStartManager *m_autoStartManager;
     int m_retryAttempts = 3;
@@ -1646,6 +1697,8 @@ private:
     ControlReconnect::Session m_controlRecovery;
     bool m_isSuspending = false;
     bool m_disconnectFinalized = false;
+    // Set when ear detection reports a pod in an ear; cleared when a drop is finalized.
+    bool m_wornThisLink = false;
     QString m_lastAirPodsAddress;
     QString m_lastAirPodsName;
 

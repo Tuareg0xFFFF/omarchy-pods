@@ -16,6 +16,10 @@ private slots:
     void returnsEmptyWhenNothingQualifies();
     void readsTheCodecOutOfAProfileDescription();
     void readsTheCodecOutOfTheProfileNameToo();
+    void keepsAPlaybackProfileAlreadyActive();
+    void picksTheProfileForTheCodecTheLinkCarries();
+    void takesPipeWiresChoiceBeforeTheLinkHasACodec();
+    void readsTheA2dpCodecId();
 };
 
 static QVector<ProfileCandidate> airPodsCard()
@@ -153,6 +157,46 @@ void TestProfileChoice::readsTheCodecOutOfTheProfileNameToo()
         {"a2dp-sink-sbc_xq", "Reproduccion de alta fidelidad (A2DP Sink)", 131, true, 1, 0},
     };
     QCOMPARE(bestPlaybackProfile(translated), QString("a2dp-sink-sbc_xq"));
+}
+
+void TestProfileChoice::keepsAPlaybackProfileAlreadyActive()
+{
+    // A live AAC to SBC switch right after connect went unanswered for 25s in 15 of 69 connects and wedged the sink.
+    QCOMPARE(decideProfile(airPodsCard(), "a2dp-sink", "AAC").action, ProfileDecision::Keep);
+    QCOMPARE(decideProfile(airPodsCard(), "a2dp-sink-sbc", "SBC").action, ProfileDecision::Keep);
+}
+
+void TestProfileChoice::picksTheProfileForTheCodecTheLinkCarries()
+{
+    // 2026-10-04: the card was still `off` 0.5s after connect, and the bitrate rule asked an AAC link for SBC.
+    const ProfileDecision aac = decideProfile(airPodsCard(), "off", "AAC");
+    QCOMPARE(aac.action, ProfileDecision::Activate);
+    QCOMPARE(aac.profile, QString("a2dp-sink"));
+    // An SBC link takes the best SBC profile, SBC-XQ included.
+    QCOMPARE(decideProfile(airPodsCard(), "off", "SBC").profile, QString("a2dp-sink-sbc_xq"));
+    QCOMPARE(decideProfile(airPodsCard(), "headset-head-unit", "AAC").profile, QString("a2dp-sink"));
+    // A codec the card has no profile for falls back to the highest bitrate.
+    QCOMPARE(decideProfile(airPodsCard(), "off", "LDAC").profile, QString("a2dp-sink-sbc_xq"));
+}
+
+void TestProfileChoice::takesPipeWiresChoiceBeforeTheLinkHasACodec()
+{
+    // 2026-10-05: waiting here left a fresh pair on `off` for good, since BlueZ makes no transport until a profile is chosen.
+    const ProfileDecision first = decideProfile(airPodsCard(), "off", QString());
+    QCOMPARE(first.action, ProfileDecision::Activate);
+    QCOMPARE(first.profile, QString("a2dp-sink"));
+    QVector<ProfileCandidate> headsetOnly = {
+        {"off", "Off", 0, true, 0, 0},
+        {"headset-head-unit", "Headset Head Unit (HSP/HFP, codec MSBC)", 6, true, 1, 1},
+    };
+    QCOMPARE(decideProfile(headsetOnly, "off", QString()).action, ProfileDecision::Wait);
+}
+
+void TestProfileChoice::readsTheA2dpCodecId()
+{
+    QCOMPARE(codecFamilyFromA2dpId(0x00), QString("SBC"));
+    QCOMPARE(codecFamilyFromA2dpId(0x02), QString("AAC"));
+    QVERIFY(codecFamilyFromA2dpId(0xff).isEmpty());
 }
 
 QTEST_GUILESS_MAIN(TestProfileChoice)

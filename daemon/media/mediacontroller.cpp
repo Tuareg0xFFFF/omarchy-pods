@@ -6,17 +6,25 @@
 #include "playerstatuswatcher.h"
 #include "pulseaudiocontroller.h"
 #include "snaptogrid.hpp"
+#include "../BluetoothMonitor.h"
 
 #include <QDebug>
 #include <QProcess>
 #include <QThread>
 #include <QRegularExpression>
 #include <QDBusConnection>
+#include <QDBusMessage>
+#include <QDBusInterface>
 #include <QDBusConnectionInterface>
 #include <QTimer>
 
 // Long enough to outlast an ANC or transparency reconfigure, short enough not to strand playback.
 static constexpr int bothPodsOutSettleMs = 1200;
+// A pod that drops out and returns inside this window was never really removed: AirPods
+// misreport a single pod during ANC changes, a reseat, or a brush against the stem. Pausing
+// on that flap tears a playing stream down and puts it back a beat later, which some players
+// never recover from, so the removal has to hold for this long before it counts.
+static constexpr int podOutSettleMs = 1200;
 
 MediaController::MediaController(QObject *parent) : QObject(parent) {
   m_pulseAudio = new PulseAudioController(this);
@@ -100,9 +108,41 @@ void MediaController::handleEarDetection(EarDetection *earDetection)
   {
     if (getCurrentMediaState() == Playing)
     {
-      LOG_DEBUG("Pausing playback for ear detection");
-      pause();
+      // Keep the first deadline, so a pod reported out repeatedly cannot defer the pause forever.
+      if (!m_podOutPending)
+      {
+        m_podOutPending = true;
+        QTimer::singleShot(podOutSettleMs, this, [this, earDetection]() {
+          m_podOutPending = false;
+          if (earDetectionBehavior == Disabled)
+            return;
+
+          // Re-read rather than trust the report that armed this: a pod back in the ear
+          // by now means the removal was a flap, and pausing would be wrong.
+          const bool primaryStillIn = earDetection->isPrimaryInEar();
+          const bool secondaryStillIn = earDetection->isSecondaryInEar();
+          const bool stillRemoved = (earDetectionBehavior == PauseWhenOneRemoved)
+                                        ? (!primaryStillIn || !secondaryStillIn)
+                                        : (!primaryStillIn && !secondaryStillIn);
+          if (!stillRemoved)
+          {
+            LOG_DEBUG("Pod returned within the settle window, not pausing");
+            return;
+          }
+
+          if (!isActiveOutputDeviceAirPods() || getCurrentMediaState() != Playing)
+            return;
+
+          LOG_DEBUG("Pausing playback for ear detection");
+          pause();
+        });
+      }
     }
+  }
+  else if (shouldResume)
+  {
+    // Both pods are back, so a pause still waiting on its deadline has nothing left to act on.
+    m_podOutPending = false;
   }
 
   // Then handle device profile switching, with both pods out already returned above
@@ -266,23 +306,24 @@ bool MediaController::activateA2dpProfile() {
     }
   }
 
-  QString preferredProfile = getPreferredA2dpProfile();
-  if (preferredProfile.isEmpty()) {
-    LOG_ERROR("No suitable A2DP profile found");
-    return false;
-  }
-
-  // Re-applying the profile already in place tears the live sink down under a playing stream.
+  const QVector<ProfileCandidate> profiles = m_pulseAudio->getCardProfiles(m_deviceOutputName);
   const QString activeProfile = m_pulseAudio->getActiveCardProfile(m_deviceOutputName);
-  if (activeProfile == preferredProfile) {
-    LOG_INFO("Best profile already active: " << activeProfile);
+  const QString codec = linkCodec();
+  const ProfileDecision decision = decideProfile(profiles, activeProfile, codec);
+  if (decision.action == ProfileDecision::Keep) {
+    LOG_INFO("A2DP already active on " << activeProfile << " ("
+             << profileDescription(profiles, activeProfile) << "), keeping the codec the link negotiated");
+  } else if (decision.action == ProfileDecision::Wait) {
+    LOG_WARN("No A2DP playback profile on the card yet");
+    return false;
   } else {
-    LOG_INFO("Activating best output profile: " << preferredProfile);
-    if (!m_pulseAudio->setCardProfile(m_deviceOutputName, preferredProfile)) {
-      LOG_ERROR("Failed to activate profile: " << preferredProfile);
+    LOG_INFO("Activating output profile: " << decision.profile << " ("
+             << profileDescription(profiles, decision.profile) << ") for link codec " << (codec.isEmpty() ? QStringLiteral("none yet") : codec));
+    if (!m_pulseAudio->setCardProfile(m_deviceOutputName, decision.profile)) {
+      LOG_ERROR("Failed to activate profile: " << decision.profile);
       return false;
     }
-    LOG_INFO("Profile activated: " << preferredProfile);
+    LOG_INFO("Profile activated: " << decision.profile);
   }
 
   // AirPods stem swipes write 1/15 steps over AVRCP, so snap them onto the 5% grid.
@@ -292,6 +333,27 @@ bool MediaController::activateA2dpProfile() {
   }
 
   return true;
+}
+
+// Empty while BlueZ has no A2DP transport for the device. Only A2DP transports sit under a sepN path.
+QString MediaController::linkCodec() const {
+  QDBusInterface objectManager("org.bluez", "/", "org.freedesktop.DBus.ObjectManager",
+                               QDBusConnection::systemBus());
+  const QDBusMessage reply = objectManager.call("GetManagedObjects");
+  if (reply.type() != QDBusMessage::ReplyMessage || reply.arguments().isEmpty()) {
+    return QString();
+  }
+  ManagedObjectList objects;
+  reply.arguments().constFirst().value<QDBusArgument>() >> objects;
+  const QString prefix = "/dev_" + QString(connectedDeviceMacAddress).replace(':', '_') + "/sep";
+  for (auto it = objects.constBegin(); it != objects.constEnd(); ++it) {
+    if (!it.key().path().contains(prefix)) continue;
+    const QVariantMap transport = it.value().value("org.bluez.MediaTransport1");
+    if (transport.contains("Codec")) {
+      return codecFamilyFromA2dpId(transport.value("Codec").toInt());
+    }
+  }
+  return QString();
 }
 
 void MediaController::activateA2dpProfileWithRetry(const QString &macAddress) {

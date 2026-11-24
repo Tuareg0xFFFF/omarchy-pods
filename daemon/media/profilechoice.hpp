@@ -84,3 +84,78 @@ inline QString bestPlaybackProfile(const QVector<ProfileCandidate> &candidates)
     }
     return best;
 }
+
+// True when the card lists this name as a profile that plays without a microphone.
+inline bool isPlaybackProfile(const QVector<ProfileCandidate> &candidates, const QString &name)
+{
+    for (const ProfileCandidate &c : candidates) {
+        if (c.name == name) {
+            return c.available && c.sinks > 0 && c.sources == 0;
+        }
+    }
+    return false;
+}
+
+// SBC-XQ is SBC at a higher bitpool, so both belong to the SBC family.
+inline QString codecFamily(const ProfileCandidate &c)
+{
+    QString codec = codecFromProfileName(c.name);
+    if (codecBitrateKbps(codec) == 0) {
+        codec = codecFromDescription(c.description);
+    }
+    return codec.startsWith("SBC") ? QStringLiteral("SBC") : codec;
+}
+
+// Sample input: MediaTransport1.Codec, the A2DP codec id from the Bluetooth assigned numbers.
+inline QString codecFamilyFromA2dpId(int id)
+{
+    if (id == 0x00) return QStringLiteral("SBC");
+    if (id == 0x02) return QStringLiteral("AAC");
+    return QString();
+}
+
+struct ProfileDecision {
+    enum Action { Keep, Wait, Activate };
+    Action action;
+    QString profile;
+};
+
+// Asks only for the codec the link already carries: the AirPods can leave a codec switch
+// unanswered for the 25s D-Bus timeout, and WirePlumber then keeps the profile with no sink.
+inline ProfileDecision decideProfile(const QVector<ProfileCandidate> &candidates, const QString &active,
+                                     const QString &linkCodec)
+{
+    if (isPlaybackProfile(candidates, active)) {
+        return {ProfileDecision::Keep, active};
+    }
+    if (linkCodec.isEmpty()) {
+        // No transport yet, so this is the first configuration, not a switch. Take the profile
+        // WirePlumber would pick itself, so the two cannot race to different codecs.
+        QString first;
+        int firstPriority = -1;
+        for (const ProfileCandidate &c : candidates) {
+            if (isPlaybackProfile(candidates, c.name) && c.priority > firstPriority) {
+                firstPriority = c.priority;
+                first = c.name;
+            }
+        }
+        if (first.isEmpty()) {
+            return {ProfileDecision::Wait, QString()};
+        }
+        return {ProfileDecision::Activate, first};
+    }
+    QVector<ProfileCandidate> sameCodec;
+    for (const ProfileCandidate &c : candidates) {
+        if (codecFamily(c) == linkCodec) {
+            sameCodec.append(c);
+        }
+    }
+    QString profile = bestPlaybackProfile(sameCodec);
+    if (profile.isEmpty()) {
+        profile = bestPlaybackProfile(candidates);
+    }
+    if (profile.isEmpty()) {
+        return {ProfileDecision::Wait, QString()};
+    }
+    return {ProfileDecision::Activate, profile};
+}
